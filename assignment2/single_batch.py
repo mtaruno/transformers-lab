@@ -70,6 +70,7 @@ class Engine:
             v = x.matmul(self.weights["self_attn_v_proj_weight"][current_layer].t())
             q = x.matmul(self.weights["self_attn_q_proj_weight"][current_layer].t())
 
+
             # Apply RoPE to query and key using the helper function
             offset = 0 if prefill else self.kv_cache[current_layer]["k"].shape[0]
             apply_rope(q, output=q, head_dim=self.head_dim, offset=offset)
@@ -149,6 +150,7 @@ class Engine:
             attn_output = attn_output.reshape(
                 -1, self.num_qo_heads * self.head_dim
             )  # (seq_len, num_qo_heads * head_dim)
+
             prefill_output = (
                 attn_output.matmul(self.weights["o_proj_weight"][current_layer].t())
                 + hidden_state

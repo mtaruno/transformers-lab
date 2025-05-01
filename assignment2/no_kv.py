@@ -99,6 +99,8 @@ class Engine:
             attn_output = torch.matmul(
                 attn_weights, v_t
             )  # (num_qo_heads, seq_len, head_dim)
+
+
             attn_output = attn_output.permute(
                 1, 0, 2
             )  # (seq_len, num_qo_heads, head_dim)
@@ -106,6 +108,7 @@ class Engine:
             attn_output = attn_output.reshape(
                 -1, self.num_qo_heads * self.head_dim
             )  # (seq_len, num_qo_heads * head_dim)
+
             prefill_output = (
                 attn_output.matmul(self.weights["o_proj_weight"][current_layer].t())
                 + hidden_state
@@ -169,7 +172,7 @@ class Engine:
 # Main Loop: Text Generation
 ########################################
 if __name__ == "__main__":
-    input_string = "Hello " * 1022
+    input_string = "Hi, who are you?"
     engine = Engine()
     times = {}
     for output_length in range(2048, 2049, 128):
