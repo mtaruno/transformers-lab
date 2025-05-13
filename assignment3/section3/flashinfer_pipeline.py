@@ -286,6 +286,8 @@ class Engine:
                 [self.kv_cache_map[r.request_id] for r in requests]
             )
 
+            rope_theta = 500000.0
+
             # ----------------------------------------------------------------
             # 4) Plan FlashInfer execution for batch
             # ----------------------------------------------------------------
@@ -301,11 +303,12 @@ class Engine:
                     head_dim_qk=self.head_dim,
                     pos_encoding_mode="ROPE_LLAMA",
                     page_size=self.page_size,
+                    rope_theta=rope_theta,
                 )
             else:
                 # plan decode wrapper
                 self.decode_wrapper.plan(
-                    indptr=indptr_tensor[num_decode_req:],
+                    indptr=kv_indptr,
                     indices=kv_indices,
                     last_page_len=kv_last_page_len,
                     num_qo_heads=self.num_qo_heads,
@@ -313,10 +316,8 @@ class Engine:
                     head_dim=self.head_dim,
                     pos_encoding_mode="ROPE_LLAMA",
                     page_size=self.page_size,
+                    rope_theta=rope_theta,
                 )
-                #########
-                # FIXME #
-                #########
 
             # ----------------------------------------------------------------
             # 5) Forward pass through all *transformer* layers
@@ -344,9 +345,8 @@ class Engine:
                 # Use flashinfer.apply_rope_inplace
                 # apply ROPE, Note the the theta is set to 500_000.0 and offsets should be the current sequence length before allocate new tokens
 
-                theta = 500000.0
                 flashinfer.apply_rope_inplace(
-                    q, k, kv_indptr, offsets=seq_lens_before_t, rope_theta=theta
+                    q, k, indptr_tensor, offsets=seq_lens_before_t, rope_theta=rope_theta
                 )
 
                 # ---- Append new tokens to *paged* KV-cache ------------------
@@ -359,7 +359,6 @@ class Engine:
                 )
 
                 # Append new KV tokens to paged cache
-
                 flashinfer.append_paged_kv_cache(
                     append_key=k,
                     append_value=v,
@@ -383,7 +382,7 @@ class Engine:
                     attn_out = self.decode_wrapper.run(
                         q, (self.pool.k_datas[layer], self.pool.v_datas[layer])
                     )
-
+                
                 attn_out = attn_out.reshape(attn_out.size(0), -1)
 
                 # Residual connection
@@ -471,9 +470,10 @@ class Engine:
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     # Example batch: ten identically phrased prompts + ten location prompts
-    sample_prompts = ["Hi, who are you?"] * 100 + [
-        "The University of Washington is located in"
-    ] * 100
+    sample_prompts = (
+        ["Hi, who are you?"] * 100
+        + ["The University of Washington is located in"] * 100
+    )
 
     engine = Engine()
     generated_texts = engine.generate_batched(sample_prompts, rounds=30)
