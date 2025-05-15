@@ -1,0 +1,90 @@
+[
+  {
+    "batch_size": 1,
+    "log_batch_size": 0.0,
+    "total_time": 1.442265510559082,
+    "throughput": 177.49852445737523,
+    "prefill_op_times": {},
+    "decode_op_times": {}
+  },
+  {
+    "batch_size": 2,
+    "log_batch_size": 1.0,
+    "total_time": 1.469728946685791,
+    "throughput": 348.3635544870703,
+    "prefill_op_times": {},
+    "decode_op_times": {}
+  },
+  {
+    "batch_size": 4,
+    "log_batch_size": 2.0,
+    "total_time": 1.4774978160858154,
+    "throughput": 693.0636301803673,
+    "prefill_op_times": {},
+    "decode_op_times": {}
+  },
+  {
+    "batch_size": 8,
+    "log_batch_size": 3.0,
+    "total_time": 1.4867994785308838,
+    "throughput": 1377.4554198953863,
+    "prefill_op_times": {},
+    "decode_op_times": {}
+  },
+  {
+    "batch_size": 16,
+    "log_batch_size": 4.0,
+    "total_time": 1.4935266971588135,
+    "throughput": 2742.5020307919235,
+    "prefill_op_times": {},
+    "decode_op_times": {}
+  },
+  {
+    "batch_size": 32,
+    "log_batch_size": 5.0,
+    "total_time": 1.543001413345337,
+    "throughput": 5309.133179754619,
+    "prefill_op_times": {},
+    "decode_op_times": {}
+  },
+  {
+    "batch_size": 64,
+    "log_batch_size": 6.0,
+    "total_time": 1.601593255996704,
+    "throughput": 10229.813305378777,
+    "prefill_op_times": {},
+    "decode_op_times": {}
+  },
+  {
+    "batch_size": 128,
+    "log_batch_size": 7.0,
+    "total_time": 1.805992841720581,
+    "throughput": 18144.036478451217,
+    "prefill_op_times": {},
+    "decode_op_times": {}
+  },
+  {
+    "batch_size": 256,
+    "log_batch_size": 8.0,
+    "total_time": 2.377720355987549,
+    "throughput": 27562.534776206117,
+    "prefill_op_times": {},
+    "decode_op_times": {}
+  },
+  {
+    "batch_size": 512,
+    "log_batch_size": 9.0,
+    "total_time": 3.7711620330810547,
+    "throughput": 34756.395734317906,
+    "prefill_op_times": {},
+    "decode_op_times": {}
+  },
+  {
+    "batch_size": 1024,
+    "log_batch_size": 10.0,
+    "total_time": 7.176506280899048,
+    "throughput": 36528.08062019274,
+    "prefill_op_times": {},
+    "decode_op_times": {}
+  }
+]
