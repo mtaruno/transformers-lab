@@ -25,6 +25,22 @@ def get_model_config(model_name):
         raise ValueError(f"Unknown model: {model_name}")
 
 
+
+def do_bench(fn, warmup=1, rep=10):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    # cuda event
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(rep):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / rep
+
+
 def create_attention_tensors(
     batch_size, seq_len, num_heads, head_dim, include_batch=True
 ):
@@ -78,21 +94,13 @@ def evaluate_flash_attn_seq(model_config, p):
         batch_size, seq_len, num_heads, head_dim, include_batch=True
     )
 
-    # Warmup
-    for _ in range(3):
-        _ = flash_attn_func(q, k, v, causal=False)
-    torch.cuda.synchronize()
+    fn0 = lambda: flash_attn_func(q, k, v, causal=False)
 
-    # Benchmark
-    start_time = time.time()
-    for _ in range(10):
-        _ = flash_attn_func(q, k, v, causal=False)
-    torch.cuda.synchronize()
-    end_time = time.time()
+    time = do_bench(fn0, warmup=3, rep=10)
 
     # Calculate TFlops
     total_ops = 2 * seq_len * seq_len * num_heads * head_dim * batch_size
-    tflops = (total_ops * 10) / (end_time - start_time) / 1e12
+    tflops = (total_ops * 10) / time / 1e12
 
     return tflops
 
@@ -120,21 +128,18 @@ def evaluate_flashinfer_seq(model_config, p):
         )
     torch.cuda.synchronize()
 
-    # Benchmark
-    start_time = time.time()
-    for _ in range(10):
-        _ = flashinfer.single_prefill_with_kv_cache(
-            q,
-            k,
-            v,
-            causal=False,
-        )
-    torch.cuda.synchronize()
-    end_time = time.time()
+    fn0 = lambda: flashinfer.single_prefill_with_kv_cache(
+        q,
+        k,
+        v,
+        causal=False,
+    )
+
+    time = do_bench(fn0, warmup=3, rep=10)
 
     # Calculate TFlops
     total_ops = 2 * seq_len * seq_len * num_heads * head_dim * batch_size
-    tflops = (total_ops * 10) / (end_time - start_time) / 1e12
+    tflops = (total_ops * 10) / time / 1e12
 
     return tflops
 
@@ -316,7 +321,7 @@ def plot_performance():
     # Overall figure title and layout
     fig.suptitle("Prefill Attention Compute Utilization per Layer", fontsize=16)
     plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.savefig("attention_performance_seq.png")
+    plt.savefig("prefill_attention_performance_seq.png")
     plt.close()
 
     # Plot 2: Varying batch size with fixed sequence length
@@ -400,7 +405,7 @@ def plot_performance():
         fontsize=16,
     )
     plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.savefig("attention_performance_batch.png")
+    plt.savefig("prefill_attention_performance_batch.png")
     plt.close()
 
 
