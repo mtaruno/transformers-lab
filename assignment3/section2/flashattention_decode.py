@@ -1,497 +1,437 @@
+from einops import rearrange
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from flash_attn_interface import flash_attn_func
+from flash_attn_interface import *
 import flashinfer
 import time
+
 
 def get_model_config(model_name):
     if model_name == "llama2-7B":
         return {
             "hidden_size": 4096,
             "num_heads": 32,
+            "num_kv_heads": 8,
             "head_dim": 128,
-            "c_range": range(7, 13),  # 2^7 to 2^12
+            "p_range": range(7, 13),  # 2^7 to 2^12
         }
     elif model_name in ["llama3-8B", "llama3-70B"]:
         return {
             "hidden_size": 4096 if model_name == "llama3-8B" else 8192,
             "num_heads": 32 if model_name == "llama3-8B" else 64,
+            "num_kv_heads": 8 if model_name == "llama3-8B" else 16,
             "head_dim": 128,
-            "c_range": range(7, 16),  # 2^7 to 2^15
+            "p_range": range(7, 16),  # 2^7 to 2^15
         }
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
-def calculate_bandwidth(data_bytes, elapsed_time):
-    """Calculate memory bandwidth in GB/s from data processed and time elapsed."""
-    return data_bytes / (elapsed_time * 1e9)  # Convert to GB/s
 
-def append_to_paged_kv_cache(k_append, v_append, paged_kv_cache, kv_indices, kv_indptr, 
-                             kv_last_page_len, page_size, batch_size=1):
-    """Append new key-value pairs to a paged KV cache.
-    
+def create_attention_tensors(batch_size, seq_len, num_heads, head_dim):
+    """Create q, k, v tensors for attention computation.
+
     Args:
-        k_append: New keys to append with shape [nnz, num_heads, head_dim]
-        v_append: New values to append with shape [nnz, num_heads, head_dim]
-        paged_kv_cache: Existing paged KV cache
-        kv_indices: Page indices in the KV cache
-        kv_indptr: Indptr for the paged KV cache with shape [batch_size + 1]
-        kv_last_page_len: Length of the last page for each sequence in batch
-        page_size: Size of each page
-        batch_size: Number of sequences in the batch
+        batch_size: Batch size
+        seq_len: Sequence length
+        num_heads: Number of attention heads
+        head_dim: Dimension of each attention head
+        include_batch: Whether to include batch dimension (True for FlashAttention, False for FlashInfer)
+
+    Returns:
+        Tuple of (q, k, v) tensors
     """
-    # Get the number of new tokens to append
-    nnz_kv = k_append.size(0)
-    
-    # Calculate the current sequence lengths
-    seq_lengths = []
-    for i in range(batch_size):
-        num_pages = kv_indptr[i+1] - kv_indptr[i]
-        if num_pages > 0:
-            # Full pages + last page
-            seq_len = (num_pages - 1) * page_size + kv_last_page_len[i].item()
-        else:
-            seq_len = 0
-        seq_lengths.append(seq_len)
-    
-    # Create a tensor of sequence lengths
-    seq_lens = torch.tensor(seq_lengths, dtype=torch.int32, device="cuda")
-    
-    # Create batch indices and positions for each token
-    if batch_size == 1:
-        # Simple case: all tokens belong to the single sequence
-        batch_indices = torch.zeros(nnz_kv, dtype=torch.int32, device="cuda")
-        positions = torch.arange(seq_lens[0], seq_lens[0] + nnz_kv, dtype=torch.int32, device="cuda")
+    # Shape: [batch_size, seq_len, num_heads, head_dim]
+    q = torch.randn(
+        batch_size, seq_len, num_heads, head_dim, device="cuda", dtype=torch.float16
+    )
+    k = torch.randn(
+        batch_size, seq_len, num_heads, head_dim, device="cuda", dtype=torch.float16
+    )
+    v = torch.randn(
+        batch_size, seq_len, num_heads, head_dim, device="cuda", dtype=torch.float16
+    )
+
+    return q, k, v
+
+
+def do_bench(fn, warmup=1, rep=10):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    # cuda event
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(rep):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / rep
+
+
+def bench_flash_attention(
+    model_config,
+    seq_len,
+    page_size=16,
+    batch_size=1,
+):
+    hidden_size = model_config["hidden_size"]
+    num_heads = model_config["num_heads"]
+    head_dim = model_config["head_dim"]
+    num_kv_heads = model_config["num_kv_heads"]
+    headdim_v = head_dim
+    headdim = head_dim
+    seq_len = 2**seq_len
+    seqlen_q = seq_len
+
+    print(
+        f"\n{batch_size=}, {seq_len=}, {seqlen_q=}, {num_heads=}, {num_kv_heads=}, {head_dim=}, {headdim_v=}, {page_size=}"
+    )
+    cache_seqlens = torch.tensor([seq_len] * batch_size, device="cuda", dtype=torch.int)
+    q = torch.randn(
+        batch_size, seqlen_q, num_heads, head_dim, device="cuda", dtype=torch.float16
+    )
+    v_cache = torch.randn(
+        batch_size, seq_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float16
+    )
+    k_cache = torch.randn(
+        batch_size, seq_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float16
+    )
+    if page_size is not None:
+        assert seq_len % page_size == 0
+        k_cache, v_cache = [
+            rearrange(x, "b (n p) h d -> (b n) p h d", p=page_size)
+            for x in [k_cache, v_cache]
+        ]
+        page_table = rearrange(
+            torch.arange(
+                batch_size * seq_len // page_size, device="cuda", dtype=torch.int32
+            ),
+            "(b s) -> b s",
+            s=seq_len // page_size,
+        )
     else:
-        # Create fake indptr for append (assuming all tokens go to the same batch for simplicity)
-        # In a real implementation, this would need to handle different distributions of tokens
-        fake_append_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
-        fake_append_indptr[-1] = nnz_kv
-        
-        # Get batch indices and positions
-        batch_indices, positions = flashinfer.get_batch_indices_positions(
-            fake_append_indptr, seq_lens, nnz_kv
-        )
-    
-    # Append to paged KV cache
-    flashinfer.append_paged_kv_cache(
-        k_append,
-        v_append,
-        batch_indices,
-        positions,
-        paged_kv_cache,
-        kv_indices,
-        kv_indptr,
-        kv_last_page_len
-    )
+        page_table = None
 
-def evaluate_flash_attn_decode_seq(model_config, c, page_size=16):
-    """Evaluate FlashAttention decode performance with varying sequence lengths."""
-    batch_size = 1
-    context_len = 2**c
+    # Precomputing this saves ~2us
+    scheduler_metadata = get_scheduler_metadata(
+        batch_size,
+        seqlen_q,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        cache_seqlens,
+        q.dtype,
+        headdim_v=headdim_v,
+        page_size=page_size,
+        causal=True,
+    )
+    # scheduler_metadata = None
+    # breakpoint()
+    fn0 = lambda: flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        causal=True,
+        scheduler_metadata=scheduler_metadata,
+    )
+    # time.sleep(1)  # to avoid power throttlingF
+    # Time in ms
+    t0 = do_bench(fn0, warmup=3, rep=10)
+    # exit(0)
+
+    # should_run_flashmla = attn_variant == "mla" and page_size == 64 and flash_mla_with_kvcache is not None
+    should_run_flashmla = False
+    torch.manual_seed(0)
+
+    total_seqlen = (
+        seq_len * batch_size if cache_seqlens is None else cache_seqlens.sum().item()
+    )
+    
+    # Calculate memory I/O in bytes (16-bit = 2 bytes per element)
+    # For decode case (seqlen_q tokens attending to KV cache)
+    bytes_per_element = 2  # float16 = 2 bytes
+    
+    # 1. Read from KV cache (K and V are separate)
+    kv_cache_read = total_seqlen * num_kv_heads * head_dim * 2  # K and V
+    
+    # 2. Read query
+    q_read = batch_size * seqlen_q * num_heads * head_dim
+    
+    # 3. Write output
+    output_write = batch_size * seqlen_q * num_heads * head_dim
+    
+    # Total memory I/O in bytes
+    mem_io_bytes = (kv_cache_read + q_read + output_write) * bytes_per_element
+    
+    # Return memory bandwidth in GB/s
+    return mem_io_bytes / (t0 * 1e-3) / 1e9  # t0 is in ms, convert to seconds
+
+
+def bench_flashinfer(model_config, seq_len, batch_size=1, page_size=16):
     hidden_size = model_config["hidden_size"]
     num_heads = model_config["num_heads"]
     head_dim = model_config["head_dim"]
-    
-    # Prepare for decode (single token query and cached KV)
-    # Shape: [batch_size, 1, num_heads, head_dim] for q
-    # For KV cache: [batch_size, context_len, num_heads, head_dim]
-    q = torch.randn(batch_size, 1, num_heads, head_dim, dtype=torch.float16, device="cuda")
-    k_cache = torch.randn(batch_size, context_len, num_heads, head_dim, dtype=torch.float16, device="cuda")
-    v_cache = torch.randn(batch_size, context_len, num_heads, head_dim, dtype=torch.float16, device="cuda")
-    
-    # Current token position in sequence
-    cache_seqlens = torch.tensor([context_len], dtype=torch.int32, device="cuda")
-    
-    # Size of data processed in bytes (q, k_cache, v_cache + output)
-    data_size = (
-        q.numel() * q.element_size() +  # q tensor
-        k_cache.numel() * k_cache.element_size() +  # k_cache tensor
-        v_cache.numel() * v_cache.element_size() +  # v_cache tensor
-        (batch_size * 1 * num_heads * head_dim * 2)  # output tensor (same shape as q)
-    )
-    
-    # Warmup
-    for _ in range(3):
-        _ = flash_attn_func(
-            q, k_cache, v_cache,
-            causal=True,
-            softmax_scale=1.0 / (head_dim ** 0.5)
-        )
-    torch.cuda.synchronize()
-    
-    # Benchmark
-    start_time = time.time()
-    for _ in range(20):  # More iterations for reliable timing
-        _ = flash_attn_func(
-            q, k_cache, v_cache,
-            causal=True,
-            softmax_scale=1.0 / (head_dim ** 0.5)
-        )
-    torch.cuda.synchronize()
-    end_time = time.time()
-    
-    elapsed_time = (end_time - start_time) / 20  # Average time per call
-    bandwidth = calculate_bandwidth(data_size, elapsed_time)
-    
-    return bandwidth
+    num_kv_heads = model_config["num_kv_heads"]  # Use the model's actual kv_heads
 
-def evaluate_flashinfer_decode_seq(model_config, c, page_size=16):
-    """Evaluate FlashInfer decode performance with varying sequence lengths."""
-    batch_size = 1
-    context_len = 2**c
-    hidden_size = model_config["hidden_size"]
-    num_heads = model_config["num_heads"]
-    head_dim = model_config["head_dim"]
+    seq_len = 2**seq_len
     
-    # Calculate number of pages needed
-    num_pages = (context_len + page_size - 1) // page_size
-    
-    # Calculate last page length
-    last_page_len = context_len % page_size
-    if last_page_len == 0:
-        last_page_len = page_size
-    
-    # Create query tensor: [batch_size, num_heads, head_dim]
-    q = torch.randn(batch_size, num_heads, head_dim, dtype=torch.float16, device="cuda")
-    
-    # 1. Create and populate the paged KV cache
-    
-    # Create the indptr for KV cache
-    kv_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device="cuda")
-    
-    # Create the indices for the pages
-    kv_indices = torch.arange(num_pages, dtype=torch.int32, device="cuda")
-    
-    # Last page length
-    kv_last_page_len = torch.tensor([last_page_len], dtype=torch.int32, device="cuda")
-    
-    # Create paged KV cache: [num_pages, 2, page_size, num_heads, head_dim]
-    paged_kv = torch.zeros(
-        num_pages, 2, page_size, num_heads, head_dim, 
-        dtype=torch.float16, device="cuda"
+    print(
+        f"\n{batch_size=}, {seq_len=}, {num_heads=}, {num_kv_heads=}, {head_dim=}, {page_size=}"
     )
-    
-    # Generate the initial keys and values
-    k_initial = torch.randn(context_len, num_heads, head_dim, dtype=torch.float16, device="cuda")
-    v_initial = torch.randn(context_len, num_heads, head_dim, dtype=torch.float16, device="cuda")
-    
-    # Append initial keys and values to the paged KV cache
-    append_to_paged_kv_cache(
-        k_initial, v_initial, 
-        paged_kv, kv_indices, kv_indptr, kv_last_page_len,
-        page_size, batch_size
-    )
-    
-    # Data size calculation (q + paged_kv + output)
-    data_size = (
-        q.numel() * q.element_size() +
-        paged_kv.numel() * paged_kv.element_size() +
-        (batch_size * num_heads * head_dim * 2)  # output size (same shape as q)
-    )
-    
-    # Warmup
-    for _ in range(3):
-        _ = flashinfer.single_decode_with_kv_cache(
-            q=q,
-            paged_kv_cache=paged_kv,
-            kv_indptr=kv_indptr,
-            kv_indices=kv_indices,
-            last_page_len=kv_last_page_len,
-            page_size=page_size,
-            scale=1.0 / (head_dim ** 0.5)
-        )
-    torch.cuda.synchronize()
-    
-    # Benchmark
-    start_time = time.time()
-    for _ in range(20):
-        _ = flashinfer.single_decode_with_kv_cache(
-            q=q,
-            paged_kv_cache=paged_kv,
-            kv_indptr=kv_indptr,
-            kv_indices=kv_indices,
-            last_page_len=kv_last_page_len,
-            page_size=page_size,
-            scale=1.0 / (head_dim ** 0.5)
-        )
-    torch.cuda.synchronize()
-    end_time = time.time()
-    
-    elapsed_time = (end_time - start_time) / 20
-    bandwidth = calculate_bandwidth(data_size, elapsed_time)
-    
-    return bandwidth
 
-def evaluate_flash_attn_decode_batch(model_config, batch_size, context_len=1024, page_size=16):
-    """Evaluate FlashAttention decode performance with varying batch sizes."""
-    hidden_size = model_config["hidden_size"]
-    num_heads = model_config["num_heads"]
-    head_dim = model_config["head_dim"]
-    
-    # Prepare for decode (single token query and cached KV)
-    # Shape: [batch_size, 1, num_heads, head_dim] for q
-    # For KV cache: [batch_size, context_len, num_heads, head_dim]
-    q = torch.randn(batch_size, 1, num_heads, head_dim, dtype=torch.float16, device="cuda")
-    k_cache = torch.randn(batch_size, context_len, num_heads, head_dim, dtype=torch.float16, device="cuda")
-    v_cache = torch.randn(batch_size, context_len, num_heads, head_dim, dtype=torch.float16, device="cuda")
-    
-    # Current token position in sequence
-    cache_seqlens = torch.full((batch_size,), context_len, dtype=torch.int32, device="cuda")
-    
-    # Size of data processed in bytes (q, k_cache, v_cache + output)
-    data_size = (
-        q.numel() * q.element_size() +  # q tensor
-        k_cache.numel() * k_cache.element_size() +  # k_cache tensor
-        v_cache.numel() * v_cache.element_size() +  # v_cache tensor
-        (batch_size * 1 * num_heads * head_dim * 2)  # output tensor (same shape as q)
-    )
-    
-    # Warmup
-    for _ in range(3):
-        _ = flash_attn_func(
-            q, k_cache, v_cache,
-            causal=True,
-            softmax_scale=1.0 / (head_dim ** 0.5)
-        )
-    torch.cuda.synchronize()
-    
-    # Benchmark
-    start_time = time.time()
-    for _ in range(20):
-        _ = flash_attn_func(
-            q, k_cache, v_cache,
-            causal=True,
-            softmax_scale=1.0 / (head_dim ** 0.5)
-        )
-    torch.cuda.synchronize()
-    end_time = time.time()
-    
-    elapsed_time = (end_time - start_time) / 20
-    bandwidth = calculate_bandwidth(data_size, elapsed_time)
-    
-    return bandwidth
+    try:
+        # For batch processing, we use BatchDecodeWithPagedKVCacheWrapper
+        # Allocate workspace buffer (256MB to ensure enough space)
+        workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device="cuda")
 
-def evaluate_flashinfer_decode_batch(model_config, batch_size, context_len=1024, page_size=16):
-    """Evaluate FlashInfer decode performance with varying batch sizes."""
-    hidden_size = model_config["hidden_size"]
-    num_heads = model_config["num_heads"]
-    head_dim = model_config["head_dim"]
-    
-    # Calculate number of pages needed per sequence
-    num_pages_per_seq = (context_len + page_size - 1) // page_size
-    total_pages = batch_size * num_pages_per_seq
-    
-    # Create query tensor: [batch_size, num_heads, head_dim]
-    q = torch.randn(batch_size, num_heads, head_dim, dtype=torch.float16, device="cuda")
-    
-    # Calculate last page length
-    last_page_len = context_len % page_size
-    if last_page_len == 0:
-        last_page_len = page_size
-    
-    # 1. Create and populate the paged KV cache
-    
-    # Create the indptr for KV cache - pointing to pages for each sequence
-    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
-    for i in range(1, batch_size + 1):
-        kv_indptr[i] = i * num_pages_per_seq
-    
-    # Create the indices for the pages
-    kv_indices = torch.arange(total_pages, dtype=torch.int32, device="cuda")
-    
-    # Last page length for each sequence
-    kv_last_page_len = torch.full((batch_size,), last_page_len, dtype=torch.int32, device="cuda")
-    
-    # Create paged KV cache: [total_pages, 2, page_size, num_heads, head_dim]
-    paged_kv = torch.zeros(
-        total_pages, 2, page_size, num_heads, head_dim, 
-        dtype=torch.float16, device="cuda"
-    )
-    
-    # Generate the initial keys and values for each sequence
-    for i in range(batch_size):
-        # Create sequence-specific keys and values
-        k_seq = torch.randn(context_len, num_heads, head_dim, dtype=torch.float16, device="cuda")
-        v_seq = torch.randn(context_len, num_heads, head_dim, dtype=torch.float16, device="cuda")
+        # Create the wrapper with the correct layout
+        decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            workspace_buffer, "NHD"
+        )
+
+        # Make sure sequence length is valid for the page size
+        pages_per_seq = (seq_len + page_size - 1) // page_size
+        max_num_pages = batch_size * pages_per_seq
+
+        # Create paged KV indptr - indicates where each sequence starts in the paged KV cache
+        paged_kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
+        for i in range(1, batch_size + 1):
+            paged_kv_indptr[i] = i * pages_per_seq
+
+        # Create indices for the paged KV cache
+        paged_kv_indices = torch.arange(max_num_pages, dtype=torch.int32, device="cuda")
+
+        # Handle partial pages
+        last_page_len = seq_len % page_size
+        if last_page_len == 0:
+            last_page_len = page_size
+        paged_kv_last_page_len = torch.full(
+            (batch_size,), last_page_len, dtype=torch.int32, device="cuda"
+        )
+
+        # Create query tensor - shape: [batch_size * seq_len, num_heads, head_dim]
+        # For decode, we use a single token per sequence
+        seqlen_q = 1  # Single token decode
+        q = torch.randn(
+            batch_size * seqlen_q, num_heads, head_dim, dtype=torch.float16, device="cuda"
+        )  # Use single token per sequence for decode
+
+        # Create KV cache - shape: [num_pages, 2, page_size, num_kv_heads, head_dim]
+        # First dim is num_pages, second is K (0) and V (1)
+        kv_cache = torch.randn(
+            max_num_pages,
+            2,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            dtype=torch.float16,
+            device="cuda",
+        )
+
+        # Plan the operation
+        decode_wrapper.plan(
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+        )
+
+        fn0 = lambda: decode_wrapper.run(q, kv_cache)
         
-        # Get pages for this sequence
-        seq_indices = kv_indices[kv_indptr[i]:kv_indptr[i+1]]
-        seq_indptr = torch.tensor([0, len(seq_indices)], dtype=torch.int32, device="cuda")
-        seq_last_page_len = kv_last_page_len[i:i+1]
-        
-        # Append to specific slice of the paged KV cache
-        batch_indices = torch.zeros(context_len, dtype=torch.int32, device="cuda")
-        positions = torch.arange(context_len, dtype=torch.int32, device="cuda")
-        
-        flashinfer.append_paged_kv_cache(
-            k_seq, v_seq,
-            batch_indices, positions,
-            paged_kv, seq_indices,
-            seq_indptr, seq_last_page_len,
-            kv_layout="NHD"
-        )
-    
-    # Data size calculation (q + paged_kv + output)
-    data_size = (
-        q.numel() * q.element_size() +
-        paged_kv.numel() * paged_kv.element_size() +
-        (batch_size * num_heads * head_dim * 2)  # output size (same shape as q)
-    )
-    
-    # Warmup
-    for _ in range(3):
-        _ = flashinfer.batch_decode_with_paged_kv_cache(
-            q=q,
-            paged_kv_cache=paged_kv,
-            kv_indptr=kv_indptr,
-            kv_indices=kv_indices,
-            last_page_len=kv_last_page_len,
-            page_size=page_size,
-            scale=1.0 / (head_dim ** 0.5)
-        )
-    torch.cuda.synchronize()
-    
-    # Benchmark
-    start_time = time.time()
-    for _ in range(20):
-        _ = flashinfer.batch_decode_with_paged_kv_cache(
-            q=q,
-            paged_kv_cache=paged_kv,
-            kv_indptr=kv_indptr,
-            kv_indices=kv_indices,
-            last_page_len=kv_last_page_len,
-            page_size=page_size,
-            scale=1.0 / (head_dim ** 0.5)
-        )
-    torch.cuda.synchronize()
-    end_time = time.time()
-    
-    elapsed_time = (end_time - start_time) / 20
-    bandwidth = calculate_bandwidth(data_size, elapsed_time)
-    
-    return bandwidth
+        # Time in ms
+        t0 = do_bench(fn0, warmup=3, rep=10)
 
-def evaluate_flash_attn_decode_pagesize(model_config, page_sizes, batch_size=128, context_len=1024):
-    """Evaluate FlashAttention decode performance with varying page sizes."""
-    # FlashAttention doesn't use paged KV cache, so performance should be consistent
-    # We'll evaluate it once and replicate the result
-    bandwidth = evaluate_flash_attn_decode_batch(model_config, batch_size, context_len)
-    return [bandwidth] * len(page_sizes)
-
-def evaluate_flashinfer_decode_pagesize(model_config, page_sizes, batch_size=128, context_len=1024):
-    """Evaluate FlashInfer decode performance with varying page sizes."""
-    bandwidths = []
-    
-    for page_size in page_sizes:
-        bandwidth = evaluate_flashinfer_decode_batch(
-            model_config, batch_size, context_len, page_size
-        )
-        bandwidths.append(bandwidth)
-    
-    return bandwidths
-
-def plot_decode_performance():
-    # Model configurations
-    models = ["llama2-7B", "llama3-8B", "llama3-70B"]
-    model_configs = {name: get_model_config(name) for name in models}
-    model_display_names = ["LLaMA2-7B", "LLaMA3-8B", "LLaMA3-70B"]
-    
-    # 1. Varying sequence length with fixed batch size
-    fig1, axs1 = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
-    
-    for idx, model_name in enumerate(models):
-        config = model_configs[model_name]
-        c_values = list(config["c_range"])
-        c_seq_lengths = [2**c for c in c_values]
+        # Calculate memory I/O in bytes (16-bit = 2 bytes per element)
+        # For decode case (1 token attending to KV cache)
+        bytes_per_element = 2  # float16 = 2 bytes
         
-        # Evaluate both implementations
-        flash_attn_bandwidths = [evaluate_flash_attn_decode_seq(config, c) for c in c_values]
-        flashinfer_bandwidths = [evaluate_flashinfer_decode_seq(config, c) for c in c_values]
+        # 1. Read from KV cache (K and V are separate)
+        kv_cache_read = batch_size * seq_len * num_kv_heads * head_dim * 2  # K and V
         
-        # Plot
-        ax = axs1[idx]
-        ax.plot(c_seq_lengths, flash_attn_bandwidths, "b-o", label="FlashAttention-3")
-        ax.plot(c_seq_lengths, flashinfer_bandwidths, "r-x", label="FlashInfer")
-        ax.set_xscale("log", base=2)
-        ax.set_title(model_display_names[idx])
-        ax.set_xlabel("Context Length")
-        ax.set_ylabel("Memory Bandwidth (GB/s)")
-        ax.grid(True, which="both")
-        ax.legend()
+        # 2. Read query
+        q_read = batch_size * seqlen_q * num_heads * head_dim
+        
+        # 3. Write output
+        output_write = batch_size * seqlen_q * num_heads * head_dim
+        
+        # Total memory I/O in bytes
+        mem_io_bytes = (kv_cache_read + q_read + output_write) * bytes_per_element
+        
+        # Return memory bandwidth in GB/s
+        return mem_io_bytes / (t0 * 1e-3) / 1e9
     
-    fig1.suptitle("Decode Attention Memory Bandwidth - Varying Context Length", fontsize=16)
+    except Exception as e:
+        print(f"Error in FlashInfer benchmark: {e}")
+        # Return a placeholder value to allow the plotting to continue
+        return 0.0
+
+
+def plot_performance():
+    # Sequence lengths (powers of 2)
+    p_llama2 = 2 ** np.arange(7, 13)  # 2^7 to 2^12
+    p_llama3 = 2 ** np.arange(7, 16)  # 2^7 to 2^15
+
+    # Get real TFLOPs data
+    llama2_config = get_model_config("llama2-7B")
+    llama3_8b_config = get_model_config("llama3-8B")
+    llama3_70b_config = get_model_config("llama3-70B")
+
+    # Evaluate FlashAttention-3
+    llama2_flashattn = [bench_flash_attention(llama2_config, p) for p in range(7, 13)]
+    llama3_8b_flashattn = [
+        bench_flash_attention(llama3_8b_config, p) for p in range(7, 16)
+    ]
+    llama3_70b_flashattn = [
+        bench_flash_attention(llama3_70b_config, p) for p in range(7, 16)
+    ]
+
+    # Evaluate FlashInfer
+    llama2_flashinfer = [bench_flashinfer(llama2_config, p) for p in range(7, 13)]
+    llama3_8b_flashinfer = [bench_flashinfer(llama3_8b_config, p) for p in range(7, 16)]
+    llama3_70b_flashinfer = [
+        bench_flashinfer(llama3_70b_config, p) for p in range(7, 16)
+    ]
+
+    # Plotting setup
+    fig, axs = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
+    models = ["LLaMA2-7B", "LLaMA3-8B", "LLaMA3-70B"]
+
+    # LLaMA2-7B plot
+    axs[0].plot(p_llama2, llama2_flashattn, label="FlashAttention-3", marker="o")
+    axs[0].plot(p_llama2, llama2_flashinfer, label="FlashInfer", marker="x")
+    axs[0].set_xscale("log", base=2)
+    axs[0].set_title(models[0])
+    axs[0].set_xlabel("p (sequence length)")
+    axs[0].set_ylabel("Memory Bandwidth (GB/s)")
+    axs[0].set_xticks(p_llama2)
+    axs[0].set_xticklabels([str(p) for p in p_llama2])
+    axs[0].legend()
+    axs[0].grid(True, which="both")
+
+    # LLaMA3-8B plot
+    axs[1].plot(p_llama3, llama3_8b_flashattn, label="FlashAttention-3", marker="o")
+    axs[1].plot(p_llama3, llama3_8b_flashinfer, label="FlashInfer", marker="x")
+    axs[1].set_xscale("log", base=2)
+    axs[1].set_title(models[1])
+    axs[1].set_xlabel("p (sequence length)")
+    axs[1].set_xticks(p_llama3)
+    axs[1].set_xticklabels([str(p) for p in p_llama3])
+    axs[1].legend()
+    axs[1].grid(True, which="both")
+
+    # LLaMA3-70B plot
+    axs[2].plot(p_llama3, llama3_70b_flashattn, label="FlashAttention-3", marker="o")
+    axs[2].plot(p_llama3, llama3_70b_flashinfer, label="FlashInfer", marker="x")
+    axs[2].set_xscale("log", base=2)
+    axs[2].set_title(models[2])
+    axs[2].set_xlabel("p (sequence length)")
+    axs[2].set_xticks(p_llama3)
+    axs[2].set_xticklabels([str(p) for p in p_llama3])
+    axs[2].legend()
+    axs[2].grid(True, which="both")
+
+    # Overall figure title and layout
+    fig.suptitle("Decode Attention Memory Bandwidth per Layer", fontsize=16)
     plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.savefig("decode_performance_seq.png")
+    plt.savefig("decode_attention_performance_seq.png")
     plt.close()
-    
-    # 2. Varying batch size with fixed sequence length
+
+    # Plot 2: Varying batch size with fixed sequence length
     fig2, axs2 = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
-    
-    batch_sizes = 2 ** np.arange(7)  # 2^0 to 2^6
-    context_len = 1024
-    
-    for idx, model_name in enumerate(models):
-        config = model_configs[model_name]
-        
-        # Evaluate both implementations
-        flash_attn_bandwidths = [
-            evaluate_flash_attn_decode_batch(config, b, context_len) for b in batch_sizes
-        ]
-        flashinfer_bandwidths = [
-            evaluate_flashinfer_decode_batch(config, b, context_len) for b in batch_sizes
-        ]
-        
-        # Plot
-        ax = axs2[idx]
-        ax.plot(batch_sizes, flash_attn_bandwidths, "b-o", label="FlashAttention-3")
-        ax.plot(batch_sizes, flashinfer_bandwidths, "r-x", label="FlashInfer")
-        ax.set_xscale("log", base=2)
-        ax.set_title(model_display_names[idx])
-        ax.set_xlabel("Batch Size")
-        ax.set_ylabel("Memory Bandwidth (GB/s)")
-        ax.grid(True, which="both")
-        ax.legend()
-    
-    fig2.suptitle("Decode Attention Memory Bandwidth - Varying Batch Size", fontsize=16)
+
+    # Batch sizes from 2^0 to 2^6
+    batch_sizes = [2 ** i for i in range(7)]
+    batch_size_logs = np.arange(7)  # log2 of batch sizes
+
+    # Evaluate FlashAttention-3
+    llama2_flashattn_batch = [
+        bench_flash_attention(llama2_config, 10, batch_size=b) for b in batch_sizes
+    ]
+    llama3_8b_flashattn_batch = [
+        bench_flash_attention(llama3_8b_config, 10, batch_size=b) for b in batch_sizes
+    ]
+    llama3_70b_flashattn_batch = [
+        bench_flash_attention(llama3_70b_config, 10, batch_size=b)
+        for b in batch_sizes
+    ]
+
+    # Evaluate FlashInfer
+    llama2_flashinfer_batch = [
+        bench_flashinfer(llama2_config, 10, batch_size=b) for b in batch_sizes
+    ]
+    llama3_8b_flashinfer_batch = [
+        bench_flashinfer(llama3_8b_config, 10, batch_size=b) for b in batch_sizes
+    ]
+    llama3_70b_flashinfer_batch = [
+        bench_flashinfer(llama3_70b_config, 10, batch_size=b) for b in batch_sizes
+    ]
+
+    # LLaMA2-7B plot
+    axs2[0].plot(
+        batch_size_logs, llama2_flashattn_batch, label="FlashAttention-3", marker="o"
+    )
+    axs2[0].plot(
+        batch_size_logs, llama2_flashinfer_batch, label="FlashInfer", marker="x"
+    )
+    axs2[0].set_title(models[0])
+    axs2[0].set_xlabel("log₂(batch_size)")
+    axs2[0].set_ylabel("Memory Bandwidth (GB/s)")
+    axs2[0].set_xticks(batch_size_logs)
+    axs2[0].set_xticklabels([str(b) for b in batch_sizes])
+    axs2[0].legend()
+    axs2[0].grid(True, which="both")
+
+    # LLaMA3-8B plot
+    axs2[1].plot(
+        batch_size_logs, llama3_8b_flashattn_batch, label="FlashAttention-3", marker="o"
+    )
+    axs2[1].plot(
+        batch_size_logs, llama3_8b_flashinfer_batch, label="FlashInfer", marker="x"
+    )
+    axs2[1].set_title(models[1])
+    axs2[1].set_xlabel("log₂(batch_size)")
+    axs2[1].set_xticks(batch_size_logs)
+    axs2[1].set_xticklabels([str(b) for b in batch_sizes])
+    axs2[1].legend()
+    axs2[1].grid(True, which="both")
+
+    # LLaMA3-70B plot
+    axs2[2].plot(
+        batch_size_logs,
+        llama3_70b_flashattn_batch,
+        label="FlashAttention-3",
+        marker="o",
+    )
+    axs2[2].plot(
+        batch_size_logs, llama3_70b_flashinfer_batch, label="FlashInfer", marker="x"
+    )
+    axs2[2].set_title(models[2])
+    axs2[2].set_xlabel("log₂(batch_size)")
+    axs2[2].set_xticks(batch_size_logs)
+    axs2[2].set_xticklabels([str(b) for b in batch_sizes])
+    axs2[2].legend()
+    axs2[2].grid(True, which="both")
+
+    # Overall figure title and layout
+    fig2.suptitle(
+        "Decode Attention Memory Bandwidth per Layer (Batch Size Variation)",
+        fontsize=16,
+    )
     plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.savefig("decode_performance_batch.png")
+    plt.savefig("decode_attention_performance_batch.png")
     plt.close()
-    
-    # 3. Varying page size with fixed batch size and sequence length
-    fig3, axs3 = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
-    
-    page_sizes = [1, 2, 4, 8, 16]
-    batch_size = 128
-    context_len = 1024
-    
-    for idx, model_name in enumerate(models):
-        config = model_configs[model_name]
-        
-        # Evaluate both implementations
-        flash_attn_bandwidths = evaluate_flash_attn_decode_pagesize(
-            config, page_sizes, batch_size, context_len
-        )
-        flashinfer_bandwidths = evaluate_flashinfer_decode_pagesize(
-            config, page_sizes, batch_size, context_len
-        )
-        
-        # Plot
-        ax = axs3[idx]
-        ax.plot(page_sizes, flash_attn_bandwidths, "b-o", label="FlashAttention-3")
-        ax.plot(page_sizes, flashinfer_bandwidths, "r-x", label="FlashInfer")
-        ax.set_title(model_display_names[idx])
-        ax.set_xlabel("Page Size")
-        ax.set_ylabel("Memory Bandwidth (GB/s)")
-        ax.set_xticks(page_sizes)
-        ax.grid(True)
-        ax.legend()
-    
-    fig3.suptitle("Decode Attention Memory Bandwidth - Varying Page Size", fontsize=16)
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.savefig("decode_performance_pagesize.png")
-    plt.close()
+
 
 if __name__ == "__main__":
-    plot_decode_performance() 
+    plot_performance()
+
+    # llama2_config = get_model_config("llama2-7B")
+    # bench_flash_attention(llama2_config, 10, batch_size=1)
